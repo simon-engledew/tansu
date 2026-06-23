@@ -526,15 +526,15 @@ impl DynoStore {
         Ok(responses)
     }
 
-    /// The least batch base offset at or after `probe` in the partition, or
-    /// `None` when no batch starts at or after it. Record objects are keyed by
-    /// zero-padded base offset, so a prefix listing that starts just before
+    /// The metadata for the least batch at or after `probe` in the partition,
+    /// or `None` when no batch starts at or after it. Record objects are keyed
+    /// by zero-padded base offset, so a prefix listing that starts just before
     /// `probe` yields the next base offset first.
-    async fn batch_base_at_or_after(
+    async fn batch_meta_at_or_after(
         &self,
         topition: &Topition,
         probe: i64,
-    ) -> Result<Option<i64>> {
+    ) -> Result<Option<ObjectMeta>> {
         let location = Path::from(format!(
             "clusters/{}/topics/{}/partitions/{:0>10}/records/",
             self.cluster, topition.topic, topition.partition,
@@ -555,21 +555,32 @@ impl DynoStore {
             self.object_store.list(Some(&location))
         };
 
-        let Some(meta) = list_stream
+        list_stream
             .next()
             .await
             .transpose()
             .inspect_err(|error| error!(?error, ?topition, probe))
-            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-        else {
-            return Ok(None);
-        };
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+    }
 
-        let Some(base) = meta.location.parts().next_back() else {
-            return Ok(None);
-        };
+    /// The base offset encoded in a record object's key, or `None` when the key
+    /// has no terminal segment.
+    fn batch_base_offset(meta: &ObjectMeta) -> Result<Option<i64>> {
+        meta.location
+            .parts()
+            .next_back()
+            .map(|base| i64::from_str(&base.as_ref()[0..20]))
+            .transpose()
+            .map_err(Into::into)
+    }
 
-        Ok(Some(i64::from_str(&base.as_ref()[0..20])?))
+    /// The least batch base offset at or after `probe` in the partition, or
+    /// `None` when no batch starts at or after it.
+    async fn batch_base_at_or_after(&self, topition: &Topition, probe: i64) -> Result<Option<i64>> {
+        match self.batch_meta_at_or_after(topition, probe).await? {
+            Some(meta) => Self::batch_base_offset(&meta),
+            None => Ok(None),
+        }
     }
 
     /// The greatest batch base offset at or before `offset` in the partition.
@@ -596,6 +607,83 @@ impl DynoStore {
         }
 
         Ok(floor)
+    }
+
+    /// The offset stage for `topition`. `last_stable` is only consulted under
+    /// read-committed, and resolving it walks every transaction in the
+    /// cluster-global meta.json - whose etag churns with any transaction state
+    /// change cluster-wide - so that read is skipped for the common
+    /// read-uncommitted path (fetch and Latest list_offsets).
+    async fn offset_stage_with(
+        &self,
+        topition: &Topition,
+        isolation_level: IsolationLevel,
+    ) -> Result<OffsetStage> {
+        let stable = if isolation_level == IsolationLevel::ReadCommitted {
+            self.meta
+                .with(&self.object_store, |meta| {
+                    Ok(meta
+                        .transactions
+                        .values()
+                        .flat_map(|txn| {
+                            debug!(?txn);
+
+                            txn.epochs
+                                .values()
+                                .filter(|detail| {
+                                    detail.state.is_some_and(|state| {
+                                        state != TxnState::Committed && state != TxnState::Aborted
+                                    })
+                                })
+                                .map(BTreeMap::<Topition, Offset>::from)
+                                .collect::<Vec<_>>()
+                        })
+                        .reduce(|mut acc, e| {
+                            debug!(?acc, ?e);
+
+                            for (topition, offset_start) in e.iter() {
+                                _ = acc
+                                    .entry(topition.to_owned())
+                                    .and_modify(|existing_offset_start| {
+                                        if *existing_offset_start > *offset_start {
+                                            *existing_offset_start = *offset_start
+                                        }
+                                    })
+                                    .or_insert(*offset_start);
+                            }
+
+                            acc
+                        })
+                        .unwrap_or(BTreeMap::new()))
+                })
+                .await?
+        } else {
+            BTreeMap::new()
+        };
+
+        debug!(?stable);
+
+        let watermark = self.watermarks.lock().map(|mut locked| {
+            locked
+                .entry(topition.to_owned())
+                .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
+                .to_owned()
+        })?;
+
+        watermark
+            .with(&self.object_store, |watermark| {
+                debug!(?watermark);
+                let high_watermark = watermark.high.unwrap_or(0);
+                let log_start = watermark.low.unwrap_or(0);
+                let last_stable = stable.get(topition).copied().unwrap_or(high_watermark);
+
+                Ok(OffsetStage {
+                    last_stable,
+                    high_watermark,
+                    log_start,
+                })
+            })
+            .await
     }
 }
 
@@ -1105,13 +1193,16 @@ impl Storage for DynoStore {
                 .unwrap_or_default()
         };
 
-        let high_watermark = self.offset_stage(topition).await.map(|offset_stage| {
-            if isolation_level == IsolationLevel::ReadCommitted {
-                offset_stage.last_stable
-            } else {
-                offset_stage.high_watermark
-            }
-        })?;
+        let high_watermark = self
+            .offset_stage_with(topition, isolation_level)
+            .await
+            .map(|offset_stage| {
+                if isolation_level == IsolationLevel::ReadCommitted {
+                    offset_stage.last_stable
+                } else {
+                    offset_stage.high_watermark
+                }
+            })?;
 
         debug!(high_watermark);
 
@@ -1239,67 +1330,10 @@ impl Storage for DynoStore {
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
-        let stable = self
-            .meta
-            .with(&self.object_store, |meta| {
-                Ok(meta
-                    .transactions
-                    .values()
-                    .flat_map(|txn| {
-                        debug!(?txn);
-
-                        txn.epochs
-                            .values()
-                            .filter(|detail| {
-                                detail.state.is_some_and(|state| {
-                                    state != TxnState::Committed && state != TxnState::Aborted
-                                })
-                            })
-                            .map(BTreeMap::<Topition, Offset>::from)
-                            .collect::<Vec<_>>()
-                    })
-                    .reduce(|mut acc, e| {
-                        debug!(?acc, ?e);
-
-                        for (topition, offset_start) in e.iter() {
-                            _ = acc
-                                .entry(topition.to_owned())
-                                .and_modify(|existing_offset_start| {
-                                    if *existing_offset_start > *offset_start {
-                                        *existing_offset_start = *offset_start
-                                    }
-                                })
-                                .or_insert(*offset_start);
-                        }
-
-                        acc
-                    })
-                    .unwrap_or(BTreeMap::new()))
-            })
-            .await?;
-
-        debug!(?stable);
-
-        let watermark = self.watermarks.lock().map(|mut locked| {
-            locked
-                .entry(topition.to_owned())
-                .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
-                .to_owned()
-        })?;
-
-        watermark
-            .with(&self.object_store, |watermark| {
-                debug!(?watermark);
-                let high_watermark = watermark.high.unwrap_or(0);
-                let log_start = watermark.low.unwrap_or(0);
-                let last_stable = stable.get(topition).copied().unwrap_or(high_watermark);
-
-                Ok(OffsetStage {
-                    last_stable,
-                    high_watermark,
-                    log_start,
-                })
-            })
+        // The trait contract returns a fully-resolved last_stable, so compute it
+        // as if read-committed. Hot paths that know their isolation level call
+        // offset_stage_with directly to skip the meta.json read when they can.
+        self.offset_stage_with(topition, IsolationLevel::ReadCommitted)
             .await
     }
 
@@ -1329,7 +1363,7 @@ impl Storage for DynoStore {
                 // offset under read-committed), both tracked in the partition
                 // watermark - no listing required.
                 ListOffset::Latest => {
-                    let offset_stage = self.offset_stage(topition).await?;
+                    let offset_stage = self.offset_stage_with(topition, isolation_level).await?;
 
                     let offset = if isolation_level == IsolationLevel::ReadCommitted {
                         offset_stage.last_stable
@@ -1344,46 +1378,57 @@ impl Storage for DynoStore {
                     }
                 }
 
-                // A timestamp lookup has no index, so it scans the partition
-                // for the earliest batch written at or after the requested
-                // time.
+                // A timestamp lookup has no index, but record objects are
+                // written in offset order and last_modified is monotonic in
+                // that order, so the earliest batch at or after the requested
+                // time is found by binary search rather than a full scan: probe
+                // the offset space, read one batch's last_modified per step,
+                // and narrow towards the least qualifying batch.
                 ListOffset::Timestamp(system_time) => {
-                    let location = Path::from(format!(
-                        "clusters/{}/topics/{}/partitions/{:0>10}/records/",
-                        self.cluster, topition.topic, topition.partition,
-                    ));
-
-                    let mut list_stream = self.object_store.list(Some(&location));
+                    let high_watermark = self
+                        .offset_stage_with(topition, IsolationLevel::ReadUncommitted)
+                        .await?
+                        .high_watermark;
 
                     let mut candidate: Option<ObjectMeta> = None;
+                    let (mut lo, mut hi) = (0i64, high_watermark);
 
-                    while let Some(meta) = list_stream
-                        .next()
-                        .await
-                        .inspect(|meta| debug!(?meta))
-                        .transpose()
-                        .inspect_err(|error| error!(?error))
-                        .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-                    {
-                        if SystemTime::from(meta.last_modified) > *system_time
-                            && candidate
-                                .as_ref()
-                                .is_none_or(|found| found.last_modified > meta.last_modified)
-                        {
-                            _ = candidate.replace(meta);
+                    while lo <= hi {
+                        let mid = lo + (hi - lo) / 2;
+
+                        match self.batch_meta_at_or_after(topition, mid).await? {
+                            Some(meta) => {
+                                let base = Self::batch_base_offset(&meta)?.unwrap_or(mid);
+
+                                if SystemTime::from(meta.last_modified) > *system_time {
+                                    // Qualifies; everything at or after this
+                                    // batch also qualifies, so look lower for an
+                                    // earlier one. Narrow with `mid`, not `base`:
+                                    // `base >= mid` and no batch starts in
+                                    // [mid, base), so [lo, mid - 1] loses no
+                                    // candidate while guaranteeing progress (a
+                                    // sparse `base > mid` would leave `hi`
+                                    // unchanged and loop forever).
+                                    candidate = Some(meta);
+                                    hi = mid - 1;
+                                } else {
+                                    // Too old; last_modified is monotonic, so
+                                    // every batch at or before this one is also
+                                    // too old.
+                                    lo = base + 1;
+                                }
+                            }
+
+                            // No batch at or after mid; the answer, if any, is
+                            // below it.
+                            None => hi = mid - 1,
                         }
                     }
 
                     debug!(?candidate);
 
                     if let Some(found) = candidate {
-                        let offset = found
-                            .location
-                            .parts()
-                            .next_back()
-                            .map(|offset| i64::from_str(&offset.as_ref()[0..20]))
-                            .transpose()?
-                            .unwrap_or(0);
+                        let offset = Self::batch_base_offset(&found)?.unwrap_or(0);
 
                         ListOffsetResponse {
                             error_code: ErrorCode::None,
