@@ -525,6 +525,78 @@ impl DynoStore {
 
         Ok(responses)
     }
+
+    /// The least batch base offset at or after `probe` in the partition, or
+    /// `None` when no batch starts at or after it. Record objects are keyed by
+    /// zero-padded base offset, so a prefix listing that starts just before
+    /// `probe` yields the next base offset first.
+    async fn batch_base_at_or_after(
+        &self,
+        topition: &Topition,
+        probe: i64,
+    ) -> Result<Option<i64>> {
+        let location = Path::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records/",
+            self.cluster, topition.topic, topition.partition,
+        ));
+
+        let mut list_stream = if probe > 0 {
+            let start_after = Path::from(format!(
+                "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
+                self.cluster,
+                topition.topic,
+                topition.partition,
+                probe - 1,
+            ));
+
+            self.object_store
+                .list_with_offset(Some(&location), &start_after)
+        } else {
+            self.object_store.list(Some(&location))
+        };
+
+        let Some(meta) = list_stream
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|error| error!(?error, ?topition, probe))
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+        else {
+            return Ok(None);
+        };
+
+        let Some(base) = meta.location.parts().next_back() else {
+            return Ok(None);
+        };
+
+        Ok(Some(i64::from_str(&base.as_ref()[0..20])?))
+    }
+
+    /// The greatest batch base offset at or before `offset` in the partition.
+    /// Object listing is forward-only, so this is a binary search over
+    /// [`Self::batch_base_at_or_after`] successor probes.
+    async fn batch_base_at_or_before(
+        &self,
+        topition: &Topition,
+        offset: i64,
+    ) -> Result<Option<i64>> {
+        let mut floor = None;
+        let (mut lo, mut hi) = (0, offset);
+
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+
+            match self.batch_base_at_or_after(topition, mid).await? {
+                Some(base) if base <= offset => {
+                    floor = Some(base);
+                    lo = base + 1;
+                }
+                _ => hi = mid - 1,
+            }
+        }
+
+        Ok(floor)
+    }
 }
 
 #[async_trait]
@@ -1051,7 +1123,28 @@ impl Storage for DynoStore {
                 self.cluster, topition.topic, topition.partition
             ));
 
-            let mut list_stream = self.object_store.list(Some(&location));
+            // Record objects are keyed by zero-padded base offset, so listing
+            // order is offset order. Start the listing just before the fetch
+            // offset rather than at the start of the partition, and stop once
+            // enough batches have been seen to satisfy max_bytes. This keeps a
+            // fetch proportional to the data returned instead of O(objects in
+            // the partition).
+            let mut list_stream = if offset > 0 {
+                let start_after = Path::from(format!(
+                    "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
+                    self.cluster,
+                    topition.topic,
+                    topition.partition,
+                    offset - 1,
+                ));
+
+                self.object_store
+                    .list_with_offset(Some(&location), &start_after)
+            } else {
+                self.object_store.list(Some(&location))
+            };
+
+            let mut seen = 0u64;
 
             while let Some(meta) = list_stream
                 .next()
@@ -1062,15 +1155,21 @@ impl Storage for DynoStore {
                 .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
                 && !has_deadline_expired()
             {
-                let Some(offset) = meta.location.parts().next_back() else {
+                let Some(base_offset) = meta.location.parts().next_back() else {
                     continue;
                 };
 
-                let offset = i64::from_str(&offset.as_ref()[0..20])?;
-                debug!(offset);
+                let base_offset = i64::from_str(&base_offset.as_ref()[0..20])?;
+                debug!(base_offset);
 
-                if offset < high_watermark {
-                    _ = offsets.insert(offset);
+                if base_offset < high_watermark {
+                    _ = offsets.insert(base_offset);
+                }
+
+                seen = seen.saturating_add(meta.size as u64);
+
+                if seen >= max_bytes as u64 {
+                    break;
                 }
             }
         }
@@ -1079,10 +1178,13 @@ impl Storage for DynoStore {
 
         // The fetch offset can fall inside a batch that starts before it;
         // Kafka returns that batch whole, leaving the client to skip the
-        // records below the fetch offset. The preceding batch is dropped
-        // after decoding if it ends before the fetch offset.
+        // records below the fetch offset. A forward listing never reaches that
+        // batch, so locate its base offset directly (object listing is
+        // forward-only, so this is a binary search). The batch is dropped after
+        // decoding if it ends before the fetch offset.
         if wanted.first().copied() != Some(offset)
-            && let Some(preceding) = offsets.pop_last()
+            && let Some(preceding) = self.batch_base_at_or_before(topition, offset).await?
+            && preceding < offset
         {
             _ = wanted.insert(preceding);
         }
@@ -1206,150 +1308,99 @@ impl Storage for DynoStore {
         isolation_level: IsolationLevel,
         offsets: &[(Topition, ListOffset)],
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
-        let stable = if isolation_level == IsolationLevel::ReadCommitted {
-            self.meta
-                .with(&self.object_store, |meta| {
-                    Ok(meta
-                        .transactions
-                        .values()
-                        .flat_map(|txn| {
-                            txn.epochs
-                                .values()
-                                .filter(|detail| {
-                                    detail.state.is_some_and(|state| {
-                                        state != TxnState::Committed && state != TxnState::Aborted
-                                    })
-                                })
-                                .map(BTreeMap::<Topition, Offset>::from)
-                                .collect::<Vec<_>>()
-                        })
-                        .reduce(|mut acc, e| {
-                            debug!(?acc, ?e);
-                            for (topition, offset_start) in e.iter() {
-                                _ = acc
-                                    .entry(topition.to_owned())
-                                    .and_modify(|existing_offset_start| {
-                                        if *existing_offset_start > *offset_start {
-                                            *existing_offset_start = *offset_start
-                                        }
-                                    })
-                                    .or_insert(*offset_start);
-                            }
-
-                            acc
-                        })
-                        .unwrap_or(BTreeMap::new()))
-                })
-                .await?
-        } else {
-            BTreeMap::new()
-        };
-
         let mut responses = vec![];
 
         for (topition, offset_request) in offsets {
-            let location = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records",
-                self.cluster, topition.topic, topition.partition,
-            ));
+            let response = match offset_request {
+                // The earliest available offset is the least batch base offset
+                // present, read from the head of the records listing rather
+                // than by scanning the whole partition.
+                ListOffset::Earliest => {
+                    let offset = self.batch_base_at_or_after(topition, 0).await?.unwrap_or(0);
 
-            let mut list_stream = self.object_store.list(Some(&location));
-
-            let mut candidate: Option<ObjectMeta> = None;
-
-            while let Some(meta) = list_stream
-                .next()
-                .await
-                .inspect(|meta| debug!(?meta))
-                .transpose()
-                .inspect_err(|error| error!(?error))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-            {
-                if let Some(last) = stable.get(topition)
-                    && offset_request == &ListOffset::Latest
-                {
-                    let Some(found_offset) = candidate
-                        .as_ref()
-                        .and_then(|found| found.location.parts().next_back())
-                        .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
-                    else {
-                        continue;
-                    };
-
-                    let Some(meta_offset) = meta
-                        .location
-                        .parts()
-                        .next_back()
-                        .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
-                    else {
-                        continue;
-                    };
-
-                    if meta_offset >= *last && found_offset > meta_offset {
-                        _ = candidate.replace(meta);
-                    }
-                } else {
-                    match offset_request {
-                        ListOffset::Earliest
-                            if candidate
-                                .as_ref()
-                                .is_none_or(|found| found.last_modified > meta.last_modified) =>
-                        {
-                            _ = candidate.replace(meta);
-                        }
-
-                        ListOffset::Latest
-                            if candidate
-                                .as_ref()
-                                .is_none_or(|found| meta.last_modified > found.last_modified) =>
-                        {
-                            _ = candidate.replace(meta);
-                        }
-
-                        ListOffset::Timestamp(system_time)
-                            if SystemTime::from(meta.last_modified) > *system_time
-                                && candidate.as_ref().is_none_or(|found| {
-                                    found.last_modified > meta.last_modified
-                                }) =>
-                        {
-                            _ = candidate.replace(meta);
-                        }
-                        _ => continue,
+                    ListOffsetResponse {
+                        error_code: ErrorCode::None,
+                        offset: Some(offset),
+                        ..Default::default()
                     }
                 }
-            }
 
-            debug!(?candidate);
+                // The latest offset is the high watermark (or the last stable
+                // offset under read-committed), both tracked in the partition
+                // watermark - no listing required.
+                ListOffset::Latest => {
+                    let offset_stage = self.offset_stage(topition).await?;
 
-            if let Some(ref found) = candidate {
-                let Some(offset) = found.location.parts().next_back() else {
-                    continue;
-                };
+                    let offset = if isolation_level == IsolationLevel::ReadCommitted {
+                        offset_stage.last_stable
+                    } else {
+                        offset_stage.high_watermark
+                    };
 
-                let offset = i64::from_str(&offset.as_ref()[0..20])?;
-                debug!(offset);
-
-                responses.push((
-                    topition.to_owned(),
                     ListOffsetResponse {
                         error_code: ErrorCode::None,
-                        offset: Some(match offset_request {
-                            ListOffset::Latest => offset + 1,
-                            _ => offset,
-                        }),
-                        timestamp: Some(found.last_modified.into()),
-                    },
-                ))
-            } else {
-                responses.push((
-                    topition.to_owned(),
-                    ListOffsetResponse {
-                        error_code: ErrorCode::None,
-                        offset: Some(0),
+                        offset: Some(offset),
                         ..Default::default()
-                    },
-                ))
-            }
+                    }
+                }
+
+                // A timestamp lookup has no index, so it scans the partition
+                // for the earliest batch written at or after the requested
+                // time.
+                ListOffset::Timestamp(system_time) => {
+                    let location = Path::from(format!(
+                        "clusters/{}/topics/{}/partitions/{:0>10}/records/",
+                        self.cluster, topition.topic, topition.partition,
+                    ));
+
+                    let mut list_stream = self.object_store.list(Some(&location));
+
+                    let mut candidate: Option<ObjectMeta> = None;
+
+                    while let Some(meta) = list_stream
+                        .next()
+                        .await
+                        .inspect(|meta| debug!(?meta))
+                        .transpose()
+                        .inspect_err(|error| error!(?error))
+                        .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                    {
+                        if SystemTime::from(meta.last_modified) > *system_time
+                            && candidate
+                                .as_ref()
+                                .is_none_or(|found| found.last_modified > meta.last_modified)
+                        {
+                            _ = candidate.replace(meta);
+                        }
+                    }
+
+                    debug!(?candidate);
+
+                    if let Some(found) = candidate {
+                        let offset = found
+                            .location
+                            .parts()
+                            .next_back()
+                            .map(|offset| i64::from_str(&offset.as_ref()[0..20]))
+                            .transpose()?
+                            .unwrap_or(0);
+
+                        ListOffsetResponse {
+                            error_code: ErrorCode::None,
+                            offset: Some(offset),
+                            timestamp: Some(found.last_modified.into()),
+                        }
+                    } else {
+                        ListOffsetResponse {
+                            error_code: ErrorCode::None,
+                            offset: Some(0),
+                            ..Default::default()
+                        }
+                    }
+                }
+            };
+
+            responses.push((topition.to_owned(), response));
         }
 
         Ok(responses)
