@@ -1206,8 +1206,16 @@ impl Storage for DynoStore {
 
         debug!(high_watermark);
 
-        let mut batches = vec![];
-        let mut bytes = max_bytes as u64;
+        // Maximum batch objects fetched concurrently. Each batch is a separate
+        // object, so a serial fetch pays one round trip per batch; fetching in
+        // flight turns dozens of round trips into a few waves.
+        const FETCH_CONCURRENCY: usize = 16;
+
+        // (base offset, object key) of each batch to return, in offset order.
+        // Selection uses the sizes from the listing alone - no batch is fetched
+        // until the set is known - so the object reads can then run
+        // concurrently rather than one round trip at a time.
+        let mut selected: Vec<(i64, Path)> = vec![];
 
         // The first batch base offset reached by the forward listing, used to
         // decide whether the fetch offset is a batch boundary (see below).
@@ -1221,13 +1229,9 @@ impl Storage for DynoStore {
 
             // Record objects are keyed by zero-padded base offset, so listing
             // order is offset order. Seek the listing to just before the fetch
-            // offset and fetch each batch as it is listed, stopping as soon as
-            // max_bytes / the deadline / the batch cap is hit. Listing and
-            // fetching in one pass keeps the work proportional to the data
-            // returned: the previous two-pass form enumerated max_bytes worth
-            // of base offsets up front and then returned only the few the
-            // deadline allowed, so a consumer paid to list thousands of objects
-            // it never received.
+            // offset rather than the start of the partition, keeping the work
+            // proportional to the data returned instead of O(objects in the
+            // partition).
             let mut list_stream = if offset > 0 {
                 let start_after = Path::from(format!(
                     "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
@@ -1242,6 +1246,8 @@ impl Storage for DynoStore {
             } else {
                 self.object_store.list(Some(&location))
             };
+
+            let mut bytes = max_bytes as u64;
 
             while let Some(meta) = list_stream
                 .next()
@@ -1270,26 +1276,11 @@ impl Storage for DynoStore {
                     first_base = Some(base_offset);
                 }
 
-                let size = meta.size as u64;
+                let size = meta.size;
 
-                let mut batch = self
-                    .object_store
-                    .get(&meta.location)
-                    .await
-                    .inspect_err(|error| {
-                        error!(?error, ?topition, ?base_offset, ?min_bytes, ?max_bytes)
-                    })
-                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-                    .bytes()
-                    .await
-                    .inspect_err(|error| error!(?error, location = %meta.location))
-                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
-                    .and_then(|encoded| self.decode(encoded))?;
-                batch.base_offset = base_offset;
+                selected.push((base_offset, meta.location));
 
-                batches.push(batch);
-
-                // Always return at least one batch; otherwise stop once
+                // Always select at least one batch; otherwise stop once
                 // max_bytes is satisfied. The per-request deadline bounds
                 // wall-clock independently (see the while condition).
                 if size > bytes {
@@ -1298,40 +1289,71 @@ impl Storage for DynoStore {
 
                 bytes = bytes.saturating_sub(size);
             }
+
+            // The fetch offset can fall inside a batch that starts before it;
+            // Kafka returns that batch whole, leaving the client to skip the
+            // records below the fetch offset. The forward listing starts at or
+            // after the offset, so when the offset is not a batch boundary that
+            // batch is located directly (object listing is forward-only, so
+            // this is a binary search) and prepended. It is dropped after
+            // decoding if it ends before the offset.
+            if first_base != Some(offset)
+                && let Some(preceding) = self.batch_base_at_or_before(topition, offset).await?
+                && preceding < offset
+            {
+                let location = Path::from(format!(
+                    "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
+                    self.cluster, topition.topic, topition.partition, preceding,
+                ));
+
+                selected.insert(0, (preceding, location));
+            }
         }
 
-        // The fetch offset can fall inside a batch that starts before it; Kafka
-        // returns that batch whole, leaving the client to skip the records
-        // below the fetch offset. The forward listing starts at or after the
-        // offset, so when the offset is not a batch boundary that batch is
-        // located directly (object listing is forward-only, so this is a binary
-        // search) and prepended. It is dropped if it ends before the offset.
-        if offset < high_watermark
-            && first_base != Some(offset)
-            && let Some(preceding) = self.batch_base_at_or_before(topition, offset).await?
-            && preceding < offset
-        {
-            let location = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
-                self.cluster, topition.topic, topition.partition, preceding,
-            ));
+        // Fetch and decode the selected batches in concurrent waves, preserving
+        // offset order. The deadline is rechecked between waves so a large
+        // max_bytes selection over many objects still stops at the request
+        // deadline rather than reading the whole selection unconditionally.
+        let mut batches: Vec<deflated::Batch> = Vec::with_capacity(selected.len());
 
-            let mut batch = self
-                .object_store
-                .get(&location)
-                .await
-                .inspect_err(|error| error!(?error, ?topition, ?preceding, ?min_bytes, ?max_bytes))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-                .bytes()
-                .await
-                .inspect_err(|error| error!(?error, %location))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
-                .and_then(|encoded| self.decode(encoded))?;
-            batch.base_offset = preceding;
+        for wave in selected.chunks(FETCH_CONCURRENCY) {
+            let mut fetched: Vec<deflated::Batch> = futures::stream::iter(wave.iter().cloned())
+                .map(|(base_offset, location)| async move {
+                    let mut batch = self
+                        .object_store
+                        .get(&location)
+                        .await
+                        .inspect_err(|error| {
+                            error!(?error, ?topition, ?base_offset, ?min_bytes, ?max_bytes)
+                        })
+                        .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                        .bytes()
+                        .await
+                        .inspect_err(|error| error!(?error, %location))
+                        .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                        .and_then(|encoded| self.decode(encoded))?;
+                    batch.base_offset = base_offset;
 
-            if preceding + i64::from(batch.last_offset_delta) >= offset {
-                batches.insert(0, batch);
+                    Ok::<_, Error>(batch)
+                })
+                .buffered(FETCH_CONCURRENCY)
+                .try_collect()
+                .await?;
+
+            batches.append(&mut fetched);
+
+            if has_deadline_expired() {
+                break;
             }
+        }
+
+        // Drop the leading straddling batch when it ends before the fetch
+        // offset; only the prepended preceding batch can start below it.
+        if let Some(first) = batches.first()
+            && first.base_offset < offset
+            && first.base_offset + i64::from(first.last_offset_delta) < offset
+        {
+            _ = batches.remove(0);
         }
 
         Ok(batches)

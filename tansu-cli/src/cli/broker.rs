@@ -293,6 +293,10 @@ impl Arg {
             );
 
             println!(
+                "hi!",
+            );
+
+            println!(
                 "listening on: {} (advertised: {})",
                 listener.if_supports_color(Stream::Stdout, |text| text.style(sheet.listener)),
                 advertised_listener.if_supports_color(Stream::Stdout, |text| text
