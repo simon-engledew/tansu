@@ -15,7 +15,7 @@
 //! Dynamic Object Storage engine (S3, memory, ...)
 
 use std::{
-    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    collections::{BTreeMap, btree_map::Entry},
     fmt::{Debug, Display},
     str::FromStr,
     sync::{Arc, Mutex},
@@ -1206,7 +1206,12 @@ impl Storage for DynoStore {
 
         debug!(high_watermark);
 
-        let mut offsets = BTreeSet::new();
+        let mut batches = vec![];
+        let mut bytes = max_bytes as u64;
+
+        // The first batch base offset reached by the forward listing, used to
+        // decide whether the fetch offset is a batch boundary (see below).
+        let mut first_base = None;
 
         if offset < high_watermark {
             let location = Path::from(format!(
@@ -1215,11 +1220,14 @@ impl Storage for DynoStore {
             ));
 
             // Record objects are keyed by zero-padded base offset, so listing
-            // order is offset order. Start the listing just before the fetch
-            // offset rather than at the start of the partition, and stop once
-            // enough batches have been seen to satisfy max_bytes. This keeps a
-            // fetch proportional to the data returned instead of O(objects in
-            // the partition).
+            // order is offset order. Seek the listing to just before the fetch
+            // offset and fetch each batch as it is listed, stopping as soon as
+            // max_bytes / the deadline / the batch cap is hit. Listing and
+            // fetching in one pass keeps the work proportional to the data
+            // returned: the previous two-pass form enumerated max_bytes worth
+            // of base offsets up front and then returned only the few the
+            // deadline allowed, so a consumer paid to list thousands of objects
+            // it never received.
             let mut list_stream = if offset > 0 {
                 let start_after = Path::from(format!(
                     "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
@@ -1234,8 +1242,6 @@ impl Storage for DynoStore {
             } else {
                 self.object_store.list(Some(&location))
             };
-
-            let mut seen = 0u64;
 
             while let Some(meta) = list_stream
                 .next()
@@ -1253,76 +1259,78 @@ impl Storage for DynoStore {
                 let base_offset = i64::from_str(&base_offset.as_ref()[0..20])?;
                 debug!(base_offset);
 
-                if base_offset < high_watermark {
-                    _ = offsets.insert(base_offset);
-                }
-
-                seen = seen.saturating_add(meta.size as u64);
-
-                if seen >= max_bytes as u64 {
+                // Listing is in offset order, so once a base offset reaches the
+                // high watermark nothing beyond it is fetchable - stop rather
+                // than scanning to the end of the prefix.
+                if base_offset >= high_watermark {
                     break;
                 }
-            }
-        }
 
-        let mut wanted = offsets.split_off(&offset);
+                if first_base.is_none() {
+                    first_base = Some(base_offset);
+                }
 
-        // The fetch offset can fall inside a batch that starts before it;
-        // Kafka returns that batch whole, leaving the client to skip the
-        // records below the fetch offset. A forward listing never reaches that
-        // batch, so locate its base offset directly (object listing is
-        // forward-only, so this is a binary search). The batch is dropped after
-        // decoding if it ends before the fetch offset.
-        if wanted.first().copied() != Some(offset)
-            && let Some(preceding) = self.batch_base_at_or_before(topition, offset).await?
-            && preceding < offset
-        {
-            _ = wanted.insert(preceding);
-        }
+                let size = meta.size as u64;
 
-        let mut batches = vec![];
+                let mut batch = self
+                    .object_store
+                    .get(&meta.location)
+                    .await
+                    .inspect_err(|error| {
+                        error!(?error, ?topition, ?base_offset, ?min_bytes, ?max_bytes)
+                    })
+                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                    .bytes()
+                    .await
+                    .inspect_err(|error| error!(?error, location = %meta.location))
+                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                    .and_then(|encoded| self.decode(encoded))?;
+                batch.base_offset = base_offset;
 
-        let mut bytes = max_bytes as u64;
-
-        for base_offset in wanted {
-            debug!(?base_offset);
-
-            let location = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
-                self.cluster, topition.topic, topition.partition, base_offset,
-            ));
-
-            let get_result = self
-                .object_store
-                .get(&location)
-                .await
-                .inspect_err(|error| {
-                    error!(?error, ?topition, ?base_offset, ?min_bytes, ?max_bytes)
-                })
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?;
-
-            let size = get_result.meta.size;
-
-            let mut batch = get_result
-                .bytes()
-                .await
-                .inspect_err(|error| error!(?error, %location))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
-                .and_then(|encoded| self.decode(encoded))?;
-            batch.base_offset = base_offset;
-
-            if base_offset + i64::from(batch.last_offset_delta) >= offset {
                 batches.push(batch);
 
+                // Always return at least one batch; otherwise stop once
+                // max_bytes is satisfied. The per-request deadline bounds
+                // wall-clock independently (see the while condition).
                 if size > bytes {
                     break;
                 }
 
                 bytes = bytes.saturating_sub(size);
             }
+        }
 
-            if has_deadline_expired() {
-                break;
+        // The fetch offset can fall inside a batch that starts before it; Kafka
+        // returns that batch whole, leaving the client to skip the records
+        // below the fetch offset. The forward listing starts at or after the
+        // offset, so when the offset is not a batch boundary that batch is
+        // located directly (object listing is forward-only, so this is a binary
+        // search) and prepended. It is dropped if it ends before the offset.
+        if offset < high_watermark
+            && first_base != Some(offset)
+            && let Some(preceding) = self.batch_base_at_or_before(topition, offset).await?
+            && preceding < offset
+        {
+            let location = Path::from(format!(
+                "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
+                self.cluster, topition.topic, topition.partition, preceding,
+            ));
+
+            let mut batch = self
+                .object_store
+                .get(&location)
+                .await
+                .inspect_err(|error| error!(?error, ?topition, ?preceding, ?min_bytes, ?max_bytes))
+                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                .bytes()
+                .await
+                .inspect_err(|error| error!(?error, %location))
+                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                .and_then(|encoded| self.decode(encoded))?;
+            batch.base_offset = preceding;
+
+            if preceding + i64::from(batch.last_offset_delta) >= offset {
+                batches.insert(0, batch);
             }
         }
 
@@ -3014,6 +3022,19 @@ where
         debug!(?prefix);
 
         self.object_store.list(prefix)
+    }
+
+    // Forward to the backend so the offset is pushed down (e.g. S3 start-after)
+    // rather than falling back to the default trait impl, which lists the whole
+    // prefix and filters client-side - defeating the bounded fetch listing.
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        debug!(?prefix, ?offset);
+
+        self.object_store.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(
