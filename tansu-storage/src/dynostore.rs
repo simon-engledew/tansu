@@ -425,13 +425,6 @@ impl DynoStore {
         Ok(PutPayload::from(Bytes::from(deflated)))
     }
 
-    fn decode(&self, encoded: Bytes) -> Result<deflated::Batch> {
-        debug!(encoded = ?&encoded[..]);
-        deflated::Batch::try_from(encoded)
-            .inspect_err(|err| debug!(?err))
-            .map_err(Into::into)
-    }
-
     async fn get<V>(&self, location: &Path) -> Result<(V, Version)>
     where
         V: DeserializeOwned,
@@ -1193,35 +1186,18 @@ impl Storage for DynoStore {
                 .unwrap_or_default()
         };
 
-        let high_watermark = self
-            .offset_stage_with(topition, isolation_level)
-            .await
-            .map(|offset_stage| {
-                if isolation_level == IsolationLevel::ReadCommitted {
-                    offset_stage.last_stable
-                } else {
-                    offset_stage.high_watermark
-                }
-            })?;
-
-        debug!(high_watermark);
-
         // Maximum batch objects fetched concurrently. Each batch is a separate
-        // object, so a serial fetch pays one round trip per batch; fetching in
-        // flight turns dozens of round trips into a few waves.
-        const FETCH_CONCURRENCY: usize = 16;
+        // object, so a serial fetch pays one round trip per batch; a partition
+        // with one object per record needs a wide window to keep wall-clock down
+        // (S3 handles hundreds of concurrent GETs comfortably).
+        const FETCH_CONCURRENCY: usize = 64;
 
-        // (base offset, object key) of each batch to return, in offset order.
-        // Selection uses the sizes from the listing alone - no batch is fetched
-        // until the set is known - so the object reads can then run
-        // concurrently rather than one round trip at a time.
-        let mut selected: Vec<(i64, Path)> = vec![];
-
-        // The first batch base offset reached by the forward listing, used to
-        // decide whether the fetch offset is a batch boundary (see below).
-        let mut first_base = None;
-
-        if offset < high_watermark {
+        // Resolve the high watermark and list the candidate batches
+        // concurrently: the watermark (watermark.json) and the record listing
+        // (records/) are different objects, so overlapping them removes a round
+        // trip from the critical path. The listing here is bounded only by
+        // max_bytes; the high watermark bound is applied once both resolve.
+        let select = async {
             let location = Path::from(format!(
                 "clusters/{}/topics/{}/partitions/{:0>10}/records/",
                 self.cluster, topition.topic, topition.partition
@@ -1230,8 +1206,7 @@ impl Storage for DynoStore {
             // Record objects are keyed by zero-padded base offset, so listing
             // order is offset order. Seek the listing to just before the fetch
             // offset rather than the start of the partition, keeping the work
-            // proportional to the data returned instead of O(objects in the
-            // partition).
+            // proportional to the data returned.
             let mut list_stream = if offset > 0 {
                 let start_after = Path::from(format!(
                     "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
@@ -1247,6 +1222,10 @@ impl Storage for DynoStore {
                 self.object_store.list(Some(&location))
             };
 
+            // (base offset, object key) of each candidate batch, in offset
+            // order. The listing records keys and sizes only - nothing is
+            // fetched yet - so the reads can run concurrently afterwards.
+            let mut selected: Vec<(i64, Path)> = vec![];
             let mut bytes = max_bytes as u64;
 
             while let Some(meta) = list_stream
@@ -1265,24 +1244,12 @@ impl Storage for DynoStore {
                 let base_offset = i64::from_str(&base_offset.as_ref()[0..20])?;
                 debug!(base_offset);
 
-                // Listing is in offset order, so once a base offset reaches the
-                // high watermark nothing beyond it is fetchable - stop rather
-                // than scanning to the end of the prefix.
-                if base_offset >= high_watermark {
-                    break;
-                }
-
-                if first_base.is_none() {
-                    first_base = Some(base_offset);
-                }
-
                 let size = meta.size;
 
                 selected.push((base_offset, meta.location));
 
                 // Always select at least one batch; otherwise stop once
-                // max_bytes is satisfied. The per-request deadline bounds
-                // wall-clock independently (see the while condition).
+                // max_bytes is satisfied.
                 if size > bytes {
                     break;
                 }
@@ -1290,59 +1257,106 @@ impl Storage for DynoStore {
                 bytes = bytes.saturating_sub(size);
             }
 
-            // The fetch offset can fall inside a batch that starts before it;
-            // Kafka returns that batch whole, leaving the client to skip the
-            // records below the fetch offset. The forward listing starts at or
-            // after the offset, so when the offset is not a batch boundary that
-            // batch is located directly (object listing is forward-only, so
-            // this is a binary search) and prepended. It is dropped after
-            // decoding if it ends before the offset.
-            if first_base != Some(offset)
-                && let Some(preceding) = self.batch_base_at_or_before(topition, offset).await?
-                && preceding < offset
-            {
-                let location = Path::from(format!(
-                    "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
-                    self.cluster, topition.topic, topition.partition, preceding,
-                ));
+            Ok::<_, Error>(selected)
+        };
 
-                selected.insert(0, (preceding, location));
+        let (offset_stage, selected) =
+            tokio::join!(self.offset_stage_with(topition, isolation_level), select);
+
+        let high_watermark = offset_stage.map(|offset_stage| {
+            if isolation_level == IsolationLevel::ReadCommitted {
+                offset_stage.last_stable
+            } else {
+                offset_stage.high_watermark
             }
+        })?;
+
+        debug!(high_watermark);
+
+        let mut selected = selected?;
+
+        // Apply the high-watermark bound now that it has resolved: nothing at or
+        // beyond it is fetchable. Objects past the high watermark normally do
+        // not exist, so this rarely trims the listing; when the consumer is
+        // already caught up it drops the speculative listing entirely.
+        if offset >= high_watermark {
+            selected.clear();
+        } else if let Some(position) = selected
+            .iter()
+            .position(|(base, _)| *base >= high_watermark)
+        {
+            selected.truncate(position);
         }
 
-        // Fetch and decode the selected batches in concurrent waves, preserving
-        // offset order. The deadline is rechecked between waves so a large
-        // max_bytes selection over many objects still stops at the request
-        // deadline rather than reading the whole selection unconditionally.
+        let first_base = selected.first().map(|(base, _)| *base);
+
+        // The fetch offset can fall inside a batch that starts before it; Kafka
+        // returns that batch whole, leaving the client to skip the records below
+        // the fetch offset. The forward listing starts at or after the offset,
+        // so when the offset is not a batch boundary that batch is located
+        // directly (object listing is forward-only, so this is a binary search)
+        // and prepended. It is dropped after decoding if it ends before the
+        // offset.
+        if offset < high_watermark
+            && first_base != Some(offset)
+            && let Some(preceding) = self.batch_base_at_or_before(topition, offset).await?
+            && preceding < offset
+        {
+            let location = Path::from(format!(
+                "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
+                self.cluster, topition.topic, topition.partition, preceding,
+            ));
+
+            selected.insert(0, (preceding, location));
+        }
+
+        // Fetch and decode the selected batches concurrently, preserving offset
+        // order. Each GET + decode runs as its own task so the CPU-bound decode
+        // is spread across the runtime's worker threads instead of serialized on
+        // the polling task; `buffered` bounds the window to FETCH_CONCURRENCY in
+        // flight (it advances the stream - and so spawns - only as tasks
+        // complete). The deadline is rechecked coarsely so a very large
+        // selection still stops near the request deadline without making
+        // ordinary fetches return a count that depends on completion timing.
         let mut batches: Vec<deflated::Batch> = Vec::with_capacity(selected.len());
 
-        for wave in selected.chunks(FETCH_CONCURRENCY) {
-            let mut fetched: Vec<deflated::Batch> = futures::stream::iter(wave.iter().cloned())
-                .map(|(base_offset, location)| async move {
-                    let mut batch = self
-                        .object_store
-                        .get(&location)
-                        .await
-                        .inspect_err(|error| {
-                            error!(?error, ?topition, ?base_offset, ?min_bytes, ?max_bytes)
-                        })
-                        .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-                        .bytes()
-                        .await
-                        .inspect_err(|error| error!(?error, %location))
-                        .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
-                        .and_then(|encoded| self.decode(encoded))?;
-                    batch.base_offset = base_offset;
+        let mut fetched = futures::stream::iter(selected)
+            .map(|(base_offset, location)| {
+                let object_store = self.object_store.clone();
 
-                    Ok::<_, Error>(batch)
-                })
-                .buffered(FETCH_CONCURRENCY)
-                .try_collect()
-                .await?;
+                async move {
+                    tokio::spawn(async move {
+                        let encoded = object_store
+                            .get(&location)
+                            .await
+                            .inspect_err(|error| error!(?error, %location))
+                            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                            .bytes()
+                            .await
+                            .inspect_err(|error| error!(?error, %location))
+                            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?;
 
-            batches.append(&mut fetched);
+                        let mut batch = deflated::Batch::try_from(encoded)
+                            .inspect_err(|error| error!(?error, %location))
+                            .map_err(Error::from)?;
+                        batch.base_offset = base_offset;
 
-            if has_deadline_expired() {
+                        Ok::<deflated::Batch, Error>(batch)
+                    })
+                    .await
+                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                }
+            })
+            .buffered(FETCH_CONCURRENCY);
+
+        while let Some(batch) = fetched.next().await.transpose()? {
+            batches.push(batch);
+
+            // Coarse deadline backstop: bound the GET phase for very large
+            // selections, but check infrequently so ordinary fetches drain the
+            // whole (max_bytes-bounded) selection rather than returning a count
+            // that depends on per-batch completion timing.
+            if batches.len().is_multiple_of(256) && has_deadline_expired() {
                 break;
             }
         }
