@@ -580,6 +580,37 @@ impl DynoStore {
         Ok(floor)
     }
 
+    async fn batch_meta_after_timestamp(
+        &self,
+        topition: &Topition,
+        timestamp: SystemTime,
+        high_watermark: i64,
+    ) -> Result<Option<ObjectMeta>> {
+        let mut candidate = None;
+        let (mut lo, mut hi) = (0, high_watermark);
+
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+
+            match self.batch_meta_at_or_after(topition, mid).await? {
+                Some(meta) if SystemTime::from(meta.last_modified) > timestamp => {
+                    candidate = Some(meta);
+                    hi = mid - 1;
+                }
+
+                Some(meta) => {
+                    let base = Self::batch_base_offset(&meta)?
+                        .ok_or(Error::Api(ErrorCode::UnknownServerError))?;
+                    lo = base + 1;
+                }
+
+                None => hi = mid - 1,
+            }
+        }
+
+        Ok(candidate)
+    }
+
     fn txn_offset_commit_response_error(
         offsets: &TxnOffsetCommitRequest,
         error_code: ErrorCode,
@@ -1352,23 +1383,10 @@ impl Storage for DynoStore {
         let mut responses = vec![];
 
         for (topition, offset_request) in offsets {
-            let location = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records",
-                self.cluster, topition.topic, topition.partition,
-            ));
-
-            let mut list_stream = self.object_store.list(Some(&location));
-
-            // Earliest and (transaction-free) Latest are monotonic in the
-            // record object key, so binary search straight to them; Timestamp
-            // and Latest under an in-flight transaction still scan.
-            let mut candidate: Option<ObjectMeta> = match offset_request {
+            let candidate: Option<ObjectMeta> = match offset_request {
                 ListOffset::Earliest => self.batch_meta_at_or_after(topition, 0).await?,
 
                 ListOffset::Latest if !stable.contains_key(topition) => {
-                    // bound the search by the high watermark so it runs in
-                    // ~log2(N) probes rather than searching the whole i64
-                    // offset space (~63 probes, one S3 round-trip each)
                     let high_watermark = self.offset_stage(topition).await?.high_watermark;
 
                     match self
@@ -1380,74 +1398,19 @@ impl Storage for DynoStore {
                     }
                 }
 
-                _ => None,
-            };
+                ListOffset::Timestamp(system_time) => {
+                    let high_watermark = self.offset_stage(topition).await?.high_watermark;
 
-            let scan = matches!(offset_request, ListOffset::Timestamp(_))
-                || (offset_request == &ListOffset::Latest && stable.contains_key(topition));
-
-            while scan
-                && let Some(meta) = list_stream
-                    .next()
-                    .await
-                    .inspect(|meta| debug!(?meta))
-                    .transpose()
-                    .inspect_err(|error| error!(?error))
-                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-            {
-                if let Some(last) = stable.get(topition)
-                    && offset_request == &ListOffset::Latest
-                {
-                    let Some(found_offset) = candidate
-                        .as_ref()
-                        .and_then(|found| found.location.parts().next_back())
-                        .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
-                    else {
-                        continue;
-                    };
-
-                    let Some(meta_offset) = meta
-                        .location
-                        .parts()
-                        .next_back()
-                        .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
-                    else {
-                        continue;
-                    };
-
-                    if meta_offset >= *last && found_offset > meta_offset {
-                        _ = candidate.replace(meta);
-                    }
-                } else {
-                    match offset_request {
-                        ListOffset::Earliest
-                            if candidate
-                                .as_ref()
-                                .is_none_or(|found| found.last_modified > meta.last_modified) =>
-                        {
-                            _ = candidate.replace(meta);
-                        }
-
-                        ListOffset::Latest
-                            if candidate
-                                .as_ref()
-                                .is_none_or(|found| meta.last_modified > found.last_modified) =>
-                        {
-                            _ = candidate.replace(meta);
-                        }
-
-                        ListOffset::Timestamp(system_time)
-                            if SystemTime::from(meta.last_modified) > *system_time
-                                && candidate.as_ref().is_none_or(|found| {
-                                    found.last_modified > meta.last_modified
-                                }) =>
-                        {
-                            _ = candidate.replace(meta);
-                        }
-                        _ => continue,
-                    }
+                    self.batch_meta_after_timestamp(topition, *system_time, high_watermark)
+                        .await?
                 }
-            }
+
+                ListOffset::Latest => {
+                    let last = stable.get(topition).copied().unwrap_or(0);
+
+                    self.batch_meta_at_or_after(topition, last).await?
+                }
+            };
 
             debug!(?candidate);
 
