@@ -1188,6 +1188,12 @@ impl Storage for DynoStore {
                 self.object_store.list(Some(&location))
             };
 
+            // Bound the listing by max_bytes using the sizes reported by the
+            // listing - nothing is fetched yet. Only batches at or after the
+            // fetch offset count against the budget; those below it are merely
+            // candidates for the straddling preceding batch.
+            let mut bytes = max_bytes as u64;
+
             while let Some(meta) = list_stream
                 .next()
                 .await
@@ -1197,15 +1203,29 @@ impl Storage for DynoStore {
                 .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
                 && !has_deadline_expired()
             {
-                let Some(offset) = meta.location.parts().next_back() else {
+                let size = meta.size;
+
+                let Some(base_offset) = meta.location.parts().next_back() else {
                     continue;
                 };
 
-                let offset = i64::from_str(&offset.as_ref()[0..20])?;
-                debug!(offset);
+                let base_offset = i64::from_str(&base_offset.as_ref()[0..20])?;
+                debug!(base_offset);
 
-                if offset < high_watermark {
-                    _ = offsets.insert(offset);
+                if base_offset >= high_watermark {
+                    continue;
+                }
+
+                _ = offsets.insert(base_offset);
+
+                // Always select at least one batch at or after the offset;
+                // otherwise stop once max_bytes is satisfied.
+                if base_offset >= offset {
+                    if size > bytes {
+                        break;
+                    }
+
+                    bytes = bytes.saturating_sub(size);
                 }
             }
         }
@@ -1224,8 +1244,6 @@ impl Storage for DynoStore {
 
         let mut batches = vec![];
 
-        let mut bytes = max_bytes as u64;
-
         for base_offset in wanted {
             debug!(?base_offset);
 
@@ -1234,18 +1252,14 @@ impl Storage for DynoStore {
                 self.cluster, topition.topic, topition.partition, base_offset,
             ));
 
-            let get_result = self
+            let mut batch = self
                 .object_store
                 .get(&location)
                 .await
                 .inspect_err(|error| {
                     error!(?error, ?topition, ?base_offset, ?min_bytes, ?max_bytes)
                 })
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?;
-
-            let size = get_result.meta.size;
-
-            let mut batch = get_result
+                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
                 .bytes()
                 .await
                 .inspect_err(|error| error!(?error, %location))
@@ -1255,12 +1269,6 @@ impl Storage for DynoStore {
 
             if base_offset + i64::from(batch.last_offset_delta) >= offset {
                 batches.push(batch);
-
-                if size > bytes {
-                    break;
-                }
-
-                bytes = bytes.saturating_sub(size);
             }
 
             if has_deadline_expired() {
