@@ -604,6 +604,82 @@ impl DynoStore {
         Ok(candidate)
     }
 
+    /// The offset stage for `topition`. `last_stable` is only consulted under
+    /// read-committed, and resolving it reads the cluster-global meta.json -
+    /// whose etag churns with any transaction state change cluster-wide - so
+    /// that read is skipped for the common read-uncommitted path.
+    async fn offset_stage_with(
+        &self,
+        topition: &Topition,
+        isolation_level: IsolationLevel,
+    ) -> Result<OffsetStage> {
+        let stable = if isolation_level == IsolationLevel::ReadCommitted {
+            self.meta
+                .with(&self.object_store, |meta| {
+                    Ok(meta
+                        .transactions
+                        .values()
+                        .flat_map(|txn| {
+                            debug!(?txn);
+
+                            txn.epochs
+                                .values()
+                                .filter(|detail| {
+                                    detail.state.is_some_and(|state| {
+                                        state != TxnState::Committed && state != TxnState::Aborted
+                                    })
+                                })
+                                .map(BTreeMap::<Topition, Offset>::from)
+                                .collect::<Vec<_>>()
+                        })
+                        .reduce(|mut acc, e| {
+                            debug!(?acc, ?e);
+
+                            for (topition, offset_start) in e.iter() {
+                                _ = acc
+                                    .entry(topition.to_owned())
+                                    .and_modify(|existing_offset_start| {
+                                        if *existing_offset_start > *offset_start {
+                                            *existing_offset_start = *offset_start
+                                        }
+                                    })
+                                    .or_insert(*offset_start);
+                            }
+
+                            acc
+                        })
+                        .unwrap_or(BTreeMap::new()))
+                })
+                .await?
+        } else {
+            BTreeMap::new()
+        };
+
+        debug!(?stable);
+
+        let watermark = self.watermarks.lock().map(|mut locked| {
+            locked
+                .entry(topition.to_owned())
+                .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
+                .to_owned()
+        })?;
+
+        watermark
+            .with(&self.object_store, |watermark| {
+                debug!(?watermark);
+                let high_watermark = watermark.high.unwrap_or(0);
+                let log_start = watermark.low.unwrap_or(0);
+                let last_stable = stable.get(topition).copied().unwrap_or(high_watermark);
+
+                Ok(OffsetStage {
+                    last_stable,
+                    high_watermark,
+                    log_start,
+                })
+            })
+            .await
+    }
+
     fn txn_offset_commit_response_error(
         offsets: &TxnOffsetCommitRequest,
         error_code: ErrorCode,
@@ -1140,13 +1216,16 @@ impl Storage for DynoStore {
                 .unwrap_or_default()
         };
 
-        let high_watermark = self.offset_stage(topition).await.map(|offset_stage| {
-            if isolation_level == IsolationLevel::ReadCommitted {
-                offset_stage.last_stable
-            } else {
-                offset_stage.high_watermark
-            }
-        })?;
+        let high_watermark = self
+            .offset_stage_with(topition, isolation_level)
+            .await
+            .map(|offset_stage| {
+                if isolation_level == IsolationLevel::ReadCommitted {
+                    offset_stage.last_stable
+                } else {
+                    offset_stage.high_watermark
+                }
+            })?;
 
         debug!(high_watermark);
 
@@ -1297,67 +1376,10 @@ impl Storage for DynoStore {
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
-        let stable = self
-            .meta
-            .with(&self.object_store, |meta| {
-                Ok(meta
-                    .transactions
-                    .values()
-                    .flat_map(|txn| {
-                        debug!(?txn);
-
-                        txn.epochs
-                            .values()
-                            .filter(|detail| {
-                                detail.state.is_some_and(|state| {
-                                    state != TxnState::Committed && state != TxnState::Aborted
-                                })
-                            })
-                            .map(BTreeMap::<Topition, Offset>::from)
-                            .collect::<Vec<_>>()
-                    })
-                    .reduce(|mut acc, e| {
-                        debug!(?acc, ?e);
-
-                        for (topition, offset_start) in e.iter() {
-                            _ = acc
-                                .entry(topition.to_owned())
-                                .and_modify(|existing_offset_start| {
-                                    if *existing_offset_start > *offset_start {
-                                        *existing_offset_start = *offset_start
-                                    }
-                                })
-                                .or_insert(*offset_start);
-                        }
-
-                        acc
-                    })
-                    .unwrap_or(BTreeMap::new()))
-            })
-            .await?;
-
-        debug!(?stable);
-
-        let watermark = self.watermarks.lock().map(|mut locked| {
-            locked
-                .entry(topition.to_owned())
-                .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
-                .to_owned()
-        })?;
-
-        watermark
-            .with(&self.object_store, |watermark| {
-                debug!(?watermark);
-                let high_watermark = watermark.high.unwrap_or(0);
-                let log_start = watermark.low.unwrap_or(0);
-                let last_stable = stable.get(topition).copied().unwrap_or(high_watermark);
-
-                Ok(OffsetStage {
-                    last_stable,
-                    high_watermark,
-                    log_start,
-                })
-            })
+        // The trait contract returns a fully-resolved last_stable, so compute it
+        // as if read-committed. Hot paths that know their isolation level call
+        // offset_stage_with directly to skip the meta.json read when they can.
+        self.offset_stage_with(topition, IsolationLevel::ReadCommitted)
             .await
     }
 
@@ -1412,7 +1434,10 @@ impl Storage for DynoStore {
                 ListOffset::Earliest => self.batch_meta_at_or_after(topition, 0).await?,
 
                 ListOffset::Latest if !stable.contains_key(topition) => {
-                    let high_watermark = self.offset_stage(topition).await?.high_watermark;
+                    let high_watermark = self
+                        .offset_stage_with(topition, IsolationLevel::ReadUncommitted)
+                        .await?
+                        .high_watermark;
 
                     match self
                         .batch_base_at_or_before(topition, high_watermark)
@@ -1424,7 +1449,10 @@ impl Storage for DynoStore {
                 }
 
                 ListOffset::Timestamp(system_time) => {
-                    let high_watermark = self.offset_stage(topition).await?.high_watermark;
+                    let high_watermark = self
+                        .offset_stage_with(topition, IsolationLevel::ReadUncommitted)
+                        .await?
+                        .high_watermark;
 
                     self.batch_meta_after_timestamp(topition, *system_time, high_watermark)
                         .await?
