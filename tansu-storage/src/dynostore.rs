@@ -425,13 +425,6 @@ impl DynoStore {
         Ok(PutPayload::from(Bytes::from(deflated)))
     }
 
-    fn decode(&self, encoded: Bytes) -> Result<deflated::Batch> {
-        debug!(encoded = ?&encoded[..]);
-        deflated::Batch::try_from(encoded)
-            .inspect_err(|err| debug!(?err))
-            .map_err(Into::into)
-    }
-
     async fn get<V>(&self, location: &Path) -> Result<(V, Version)>
     where
         V: DeserializeOwned,
@@ -1242,32 +1235,56 @@ impl Storage for DynoStore {
             _ = wanted.insert(preceding);
         }
 
+        // Maximum batch objects fetched concurrently. Each batch is a separate
+        // object, so a serial fetch pays one round trip per batch; a partition
+        // with one object per record needs a wide window to keep wall-clock down
+        // (S3 handles hundreds of concurrent GETs comfortably).
+        const FETCH_CONCURRENCY: usize = 64;
+
+        // Fetch and decode the wanted batches concurrently, preserving offset
+        // order. Each GET + decode runs as its own task so the CPU-bound decode
+        // is spread across the runtime's worker threads instead of serialized on
+        // the polling task; `buffered` bounds the window to FETCH_CONCURRENCY in
+        // flight, advancing (and so spawning) only as tasks complete.
+        let mut fetched = futures::stream::iter(wanted)
+            .map(|base_offset| {
+                let object_store = self.object_store.clone();
+                let location = Path::from(format!(
+                    "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
+                    self.cluster, topition.topic, topition.partition, base_offset,
+                ));
+
+                async move {
+                    tokio::spawn(async move {
+                        let mut batch = deflated::Batch::try_from(
+                            object_store
+                                .get(&location)
+                                .await
+                                .inspect_err(|error| error!(?error, %location))
+                                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                                .bytes()
+                                .await
+                                .inspect_err(|error| error!(?error, %location))
+                                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?,
+                        )
+                        .inspect_err(|error| error!(?error, %location))
+                        .map_err(Error::from)?;
+                        batch.base_offset = base_offset;
+
+                        Ok::<deflated::Batch, Error>(batch)
+                    })
+                    .await
+                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                }
+            })
+            .buffered(FETCH_CONCURRENCY);
+
         let mut batches = vec![];
 
-        for base_offset in wanted {
-            debug!(?base_offset);
+        while let Some(batch) = fetched.next().await.transpose()? {
+            debug!(base_offset = batch.base_offset);
 
-            let location = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
-                self.cluster, topition.topic, topition.partition, base_offset,
-            ));
-
-            let mut batch = self
-                .object_store
-                .get(&location)
-                .await
-                .inspect_err(|error| {
-                    error!(?error, ?topition, ?base_offset, ?min_bytes, ?max_bytes)
-                })
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-                .bytes()
-                .await
-                .inspect_err(|error| error!(?error, %location))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
-                .and_then(|encoded| self.decode(encoded))?;
-            batch.base_offset = base_offset;
-
-            if base_offset + i64::from(batch.last_offset_delta) >= offset {
+            if batch.base_offset + i64::from(batch.last_offset_delta) >= offset {
                 batches.push(batch);
             }
 
