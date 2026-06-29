@@ -1365,7 +1365,11 @@ impl Storage for DynoStore {
                 batches.push(batch);
             }
 
-            if has_deadline_expired() {
+            // Coarse deadline backstop: bound the GET phase for very large
+            // selections, but check infrequently so ordinary fetches drain the
+            // whole (max_bytes-bounded) selection rather than returning a count
+            // that depends on which concurrent tasks happened to finish first.
+            if batches.len().is_multiple_of(256) && has_deadline_expired() {
                 break;
             }
         }
