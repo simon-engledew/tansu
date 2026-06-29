@@ -1237,21 +1237,18 @@ impl Storage for DynoStore {
                 self.cluster, topition.topic, topition.partition
             ));
 
-            // Binary search to the batch containing `offset` (its base may be
-            // below `offset`) and list forward from there, rather than scanning
-            // every record object in the partition.
-            let floor = self
-                .batch_base_at_or_before(topition, offset)
-                .await?
-                .unwrap_or(offset);
-
-            let mut list_stream = if floor > 0 {
+            // Record objects are keyed by zero-padded base offset, so listing
+            // order is offset order. Seek the listing to just before the fetch
+            // offset rather than the start of the partition, keeping the work
+            // proportional to the data returned - and avoiding a binary search
+            // on the hot path (every step of which is its own listing).
+            let mut list_stream = if offset > 0 {
                 let start_after = Path::from(format!(
                     "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
                     self.cluster,
                     topition.topic,
                     topition.partition,
-                    floor - 1,
+                    offset - 1,
                 ));
 
                 self.object_store
@@ -1261,9 +1258,8 @@ impl Storage for DynoStore {
             };
 
             // Bound the listing by max_bytes using the sizes reported by the
-            // listing - nothing is fetched yet. Only batches at or after the
-            // fetch offset count against the budget; those below it are merely
-            // candidates for the straddling preceding batch.
+            // listing - nothing is fetched yet. Every listed batch starts at or
+            // after the fetch offset, so each one counts against the budget.
             let mut bytes = max_bytes as u64;
 
             while let Some(meta) = list_stream
@@ -1290,26 +1286,28 @@ impl Storage for DynoStore {
 
                 _ = offsets.insert(base_offset);
 
-                // Always select at least one batch at or after the offset;
-                // otherwise stop once max_bytes is satisfied.
-                if base_offset >= offset {
-                    if size > bytes {
-                        break;
-                    }
-
-                    bytes = bytes.saturating_sub(size);
+                // Always select at least one batch; otherwise stop once
+                // max_bytes is satisfied.
+                if size > bytes {
+                    break;
                 }
+
+                bytes = bytes.saturating_sub(size);
             }
         }
 
-        let mut wanted = offsets.split_off(&offset);
+        let mut wanted = offsets;
 
-        // The fetch offset can fall inside a batch that starts before it;
-        // Kafka returns that batch whole, leaving the client to skip the
-        // records below the fetch offset. The preceding batch is dropped
+        // The listing starts at or after the fetch offset, so when the offset
+        // falls inside a batch that starts before it, that straddling batch is
+        // not listed. Locate it with a binary search - only when the offset is
+        // not itself a batch boundary, so the common resume-at-boundary fetch
+        // pays nothing - and prepend it. Kafka returns it whole; it is dropped
         // after decoding if it ends before the fetch offset.
-        if wanted.first().copied() != Some(offset)
-            && let Some(preceding) = offsets.pop_last()
+        if offset < high_watermark
+            && wanted.first().copied() != Some(offset)
+            && let Some(preceding) = self.batch_base_at_or_before(topition, offset).await?
+            && preceding < offset
         {
             _ = wanted.insert(preceding);
         }
